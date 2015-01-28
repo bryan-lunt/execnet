@@ -1,11 +1,12 @@
 """
 mostly functional tests of gateways.
 """
-import os, sys, time
+import os
 import py
+import pytest
 import execnet
-from execnet import gateway_base, gateway, gateway_io
-from testing.test_serializer import _find_version
+from execnet import gateway_base, gateway_io
+from test_serializer import _find_version
 TESTTIMEOUT = 10.0 # seconds
 needs_osdup = py.test.mark.skipif("not hasattr(os, 'dup')")
 
@@ -36,12 +37,25 @@ class TestBasicGateway:
 
     def test_gateway_status_simple(self, gw):
         status = gw.remote_status()
-        assert not status.execqsize
         assert status.numexecuting == 0
+
+    def test_exc_info_is_clear_after_gateway_startup(self, gw):
+        ch = gw.remote_exec("""
+                import traceback, sys
+                excinfo = sys.exc_info()
+                if excinfo != (None, None, None):
+                    r = traceback.format_exception(*excinfo)
+                else:
+                    r = 0
+                channel.send(r)
+        """)
+        res = ch.receive()
+        if res != 0:
+           pytest.fail("remote raised\n%s" % res)
 
     def test_gateway_status_no_real_channel(self, gw):
         numchan = gw._channelfactory.channels()
-        st = gw.remote_status()
+        gw.remote_status()
         numchan2 = gw._channelfactory.channels()
         # note that on CPython this can not really
         # fail because refcounting leads to immediate
@@ -54,18 +68,20 @@ class TestBasicGateway:
         ch2 = gw.remote_exec("channel.receive()")
         ch1.receive()
         status = gw.remote_status()
-        assert status.numexecuting == 1 # number of active execution threads
-        assert status.execqsize == 1 # one more queued
+        assert status.numexecuting == 2 # number of active execution threads
         assert status.numchannels == numchannels + 2
         ch1.send(None)
         ch2.send(None)
         ch1.waitclose()
         ch2.waitclose()
-        status = gw.remote_status()
-        assert status.execqsize == 0
-        assert status.numexecuting == 0
+        for i in range(10):
+            status = gw.remote_status()
+            if status.numexecuting == 0:
+                break
+        else:
+            pytest.fail("did not get correct remote status")
         # race condition
-        assert status.numchannels <= numchannels + 1
+        assert status.numchannels <= numchannels
 
     def test_remote_exec_module(self, tmpdir, gw):
         p = tmpdir.join("remotetest.py")
@@ -156,7 +172,7 @@ class TestBasicGateway:
         assert rinfo.executable
         assert rinfo.cwd
         assert rinfo.version_info
-        s = repr(rinfo)
+        assert repr(rinfo)
         old = gw.remote_exec("""
             import os.path
             cwd = os.getcwd()
@@ -267,7 +283,7 @@ class TestSshPopenGateway:
 
     def test_sshconfig_config_parsing(self, monkeypatch, makegateway):
         l = []
-        monkeypatch.setattr(gateway_io, 'Popen',
+        monkeypatch.setattr(gateway_io, "Popen2IOMaster",
             lambda *args, **kwargs: l.append(args[0]))
         py.test.raises(AttributeError, lambda:
             makegateway("ssh=xyz//ssh_config=qwe"))
@@ -320,27 +336,24 @@ class TestThreads:
 
     def test_status_with_threads(self, makegateway):
         gw = makegateway('popen')
-        gw.remote_init_threads(3)
         c1 = gw.remote_exec("channel.send(1) ; channel.receive()")
         c2 = gw.remote_exec("channel.send(2) ; channel.receive()")
         c1.receive()
         c2.receive()
         rstatus = gw.remote_status()
-        assert rstatus.numexecuting == 2 + 1
-        assert rstatus.execqsize == 0
+        assert rstatus.numexecuting == 2
         c1.send(1)
         c2.send(1)
         c1.waitclose()
         c2.waitclose()
-        rstatus = gw.remote_status()
-        assert rstatus.numexecuting == 0 + 1
-        assert rstatus.execqsize == 0
-
-    def test_threads_twice(self, makegateway):
-        gw = makegateway('popen')
-        gw.remote_init_threads(3)
-        py.test.raises(IOError, gw.remote_init_threads, 3)
-
+        # there is a slight chance that an execution thread
+        # is still active although it's accompanying channel
+        # is already closed.
+        for i in range(10):
+            rstatus = gw.remote_status()
+            if rstatus.numexecuting == 0:
+                return
+        assert 0, "numexecuting didn't drop to zero"
 
 class TestTracing:
     def test_popen_filetracing(self, testdir, monkeypatch, makegateway):

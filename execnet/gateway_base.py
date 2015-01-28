@@ -1,30 +1,29 @@
 """
 base execnet gateway code send to the other side for bootstrapping.
 
-NOTE: aims to be compatible to Python 2.3-3.1, Jython and IronPython
+NOTE: aims to be compatible to Python 2.5-3.X, Jython and IronPython
 
-(C) 2004-2009 Holger Krekel, Armin Rigo, Benjamin Peterson, and others
+(C) 2004-2013 Holger Krekel, Armin Rigo, Benjamin Peterson, Ronny Pfannschmidt and others
 """
+from __future__ import with_statement
 import sys, os, weakref
-import threading, traceback, struct
-try:
-    import queue
-except ImportError:
-    import Queue as queue
+import traceback, struct
 
-try:
-    from io import BytesIO
-except:
-    from StringIO import StringIO as BytesIO
+# NOTE that we want to avoid try/except style importing
+# to avoid setting sys.exc_info() during import
+#
 
 ISPY3 = sys.version_info >= (3, 0)
 if ISPY3:
+    from io import BytesIO
     exec("def do_exec(co, loc): exec(co, loc)\n"
          "def reraise(cls, val, tb): raise val\n")
     unicode = str
     _long_type = int
     from _thread import interrupt_main
+    SUBPROCESS32 = False
 else:
+    from StringIO import StringIO as BytesIO
     exec("def do_exec(co, loc): exec co in loc\n"
          "def reraise(cls, val, tb): raise cls, val, tb\n")
     bytes = str
@@ -33,6 +32,284 @@ else:
         from thread import interrupt_main
     except ImportError:
         interrupt_main = None
+    try:
+        import subprocess32  # NOQA
+        SUBPROCESS32 = True
+    except ImportError:
+        SUBPROCESS32 = False
+
+
+#f = open("/tmp/execnet-%s" % os.getpid(), "w")
+#def log_extra(*msg):
+#    f.write(" ".join([str(x) for x in msg]) + "\n")
+
+
+class EmptySemaphore:
+    acquire = release = lambda self: None
+
+def get_execmodel(backend):
+    if hasattr(backend, "backend"):
+        return backend
+    if backend == "thread":
+        importdef = {
+            'get_ident': ['thread::get_ident', '_thread::get_ident'],
+            '_start_new_thread': ['thread::start_new_thread',
+                                  '_thread::start_new_thread'],
+            'threading': ["threading",],
+            'queue': ["queue", "Queue"],
+            'sleep': ['time::sleep'],
+            'subprocess': ['subprocess32' if SUBPROCESS32 else 'subprocess'],
+            'socket': ['socket'],
+            '_fdopen': ['os::fdopen'],
+            '_lock': ['threading'],
+            '_event': ['threading'],
+        }
+        def exec_start(self, func, args=()):
+            self._start_new_thread(func, args)
+
+    elif backend == "eventlet":
+        importdef = {
+            'get_ident': ['eventlet.green.thread::get_ident'],
+            '_spawn_n': ['eventlet::spawn_n'],
+            'threading': ['eventlet.green.threading'],
+            'queue': ["eventlet.queue"],
+            'sleep': ['eventlet::sleep'],
+            'subprocess': ['eventlet.green.subprocess'],
+            'socket': ['eventlet.green.socket'],
+            '_fdopen': ['eventlet.green.os::fdopen'],
+            '_lock': ['eventlet.green.threading'],
+            '_event': ['eventlet.green.threading'],
+        }
+        def exec_start(self, func, args=()):
+            self._spawn_n(func, *args)
+    elif backend == "gevent":
+        importdef = {
+            'get_ident': ['gevent.thread::get_ident'],
+            '_spawn_n': ['gevent::spawn'],
+            'threading': ['threading'],
+            'queue': ["gevent.queue"],
+            'sleep': ['gevent::sleep'],
+            'subprocess': ['gevent.subprocess'],
+            'socket': ['gevent.socket'],
+            # XXX
+            '_fdopen': ['gevent.fileobject::FileObjectThread'],
+            '_lock': ['gevent.lock'],
+            '_event': ['gevent.event'],
+        }
+        def exec_start(self, func, args=()):
+            self._spawn_n(func, *args)
+    else:
+        raise ValueError("unknown execmodel %r" %(backend,))
+
+    class ExecModel:
+        def __init__(self, name):
+            self._importdef = importdef
+            self.backend = name
+            self._count = 0
+
+        def __repr__(self):
+            return "<ExecModel %r>" % self.backend
+
+        def __getattr__(self, name):
+            locs = self._importdef.get(name)
+            if locs is None:
+                raise AttributeError(name)
+            for loc in locs:
+                parts = loc.split("::")
+                loc = parts.pop(0)
+                try:
+                    mod = __import__(loc, None, None, "__doc__")
+                except ImportError:
+                    pass
+                else:
+                    if parts:
+                        mod = getattr(mod, parts[0])
+                    setattr(self, name, mod)
+                    return mod
+            raise AttributeError(name)
+
+        start = exec_start
+
+        def fdopen(self, fd, mode, bufsize=1):
+            return self._fdopen(fd, mode, bufsize)
+
+        def WorkerPool(self, hasprimary=False):
+            return WorkerPool(self, hasprimary=hasprimary)
+
+        def Semaphore(self, size=None):
+            if size is None:
+                return EmptySemaphore()
+            return self._lock.Semaphore(size)
+
+        def Lock(self):
+            return self._lock.RLock()
+
+        def RLock(self):
+            return self._lock.RLock()
+
+        def Event(self):
+            event = self._event.Event()
+            if sys.version_info < (2,7):
+                # patch wait function to return event state instead of None
+                real_wait = event.wait
+                def wait(timeout=None):
+                    real_wait(timeout=timeout)
+                    return event.isSet()
+                event.wait = wait
+            return event
+
+        def PopenPiped(self, args):
+            PIPE = self.subprocess.PIPE
+            return self.subprocess.Popen(args, stdout=PIPE, stdin=PIPE)
+
+
+    return ExecModel(backend)
+
+
+class Reply(object):
+    """ reply instances provide access to the result
+        of a function execution that got dispatched
+        through WorkerPool.spawn()
+    """
+    def __init__(self, task, threadmodel):
+        self.task = task
+        self._result_ready = threadmodel.Event()
+        self.running = True
+
+    def get(self, timeout=None):
+        """ get the result object from an asynchronous function execution.
+            if the function execution raised an exception,
+            then calling get() will reraise that exception
+            including its traceback.
+        """
+        self.waitfinish(timeout)
+        try:
+            return self._result
+        except AttributeError:
+            reraise(*(self._excinfo[:3]))  # noqa
+
+    def waitfinish(self, timeout=None):
+        if not self._result_ready.wait(timeout):
+            raise IOError("timeout waiting for %r" %(self.task, ))
+
+    def run(self):
+        func, args, kwargs = self.task
+        try:
+            try:
+                self._result = func(*args, **kwargs)
+            except:
+                # sys may be already None when shutting down the interpreter
+                if sys is not None:
+                    self._excinfo = sys.exc_info()
+        finally:
+            self._result_ready.set()
+            self.running = False
+
+
+class WorkerPool(object):
+    """ A WorkerPool allows to spawn function executions
+        to threads, returning a reply object on which you
+        can ask for the result (and get exceptions reraised).
+
+        This implementation allows the main thread to integrate
+        itself into performing function execution through
+        calling integrate_as_primary_thread() which will return
+        when the pool received a trigger_shutdown().
+    """
+    def __init__(self, execmodel, hasprimary=False):
+        """ by default allow unlimited number of spawns. """
+        self.execmodel = execmodel
+        self._running_lock = self.execmodel.Lock()
+        self._running = set()
+        self._shuttingdown = False
+        self._waitall_events = []
+        if hasprimary:
+            if self.execmodel.backend != "thread":
+                raise ValueError("hasprimary=True requires thread model")
+            self._primary_thread_task_ready = self.execmodel.Event()
+        else:
+            self._primary_thread_task_ready = None
+
+    def integrate_as_primary_thread(self):
+        """ integrate the thread with which we are called as a primary
+        thread for executing functions triggered with spawn().
+        """
+        assert self.execmodel.backend == "thread", self.execmodel
+        primary_thread_task_ready = self._primary_thread_task_ready
+        # interacts with code at REF1
+        while 1:
+            primary_thread_task_ready.wait()
+            reply = self._primary_thread_task
+            if reply is None:  # trigger_shutdown() woke us up
+                break
+            self._perform_spawn(reply)
+            # we are concurrent with trigger_shutdown and spawn
+            with self._running_lock:
+                if self._shuttingdown:
+                    break
+                primary_thread_task_ready.clear()
+
+    def trigger_shutdown(self):
+        with self._running_lock:
+            self._shuttingdown = True
+            if self._primary_thread_task_ready is not None:
+                self._primary_thread_task = None
+                self._primary_thread_task_ready.set()
+
+    def active_count(self):
+        return len(self._running)
+
+    def _perform_spawn(self, reply):
+        reply.run()
+        with self._running_lock:
+            self._running.remove(reply)
+            if not self._running:
+                while self._waitall_events:
+                    waitall_event = self._waitall_events.pop()
+                    waitall_event.set()
+
+    def _try_send_to_primary_thread(self, reply):
+        # REF1 in 'thread' model we give priority to running in main thread
+        # note that we should be called with _running_lock hold
+        primary_thread_task_ready = self._primary_thread_task_ready
+        if primary_thread_task_ready is not None:
+            if not primary_thread_task_ready.isSet():
+                self._primary_thread_task = reply
+                # wake up primary thread
+                primary_thread_task_ready.set()
+                return True
+        return False
+
+    def spawn(self, func, *args, **kwargs):
+        """ return Reply object for the asynchronous dispatch
+            of the given func(*args, **kwargs).
+        """
+        reply = Reply((func, args, kwargs), self.execmodel)
+        with self._running_lock:
+            if self._shuttingdown:
+                raise ValueError("pool is shutting down")
+            self._running.add(reply)
+            if not self._try_send_to_primary_thread(reply):
+                self.execmodel.start(self._perform_spawn, (reply,))
+        return reply
+
+    def terminate(self, timeout=None):
+        """ trigger shutdown and wait for completion of all executions. """
+        self.trigger_shutdown()
+        return self.waitall(timeout=timeout)
+
+    def waitall(self, timeout=None):
+        """ wait until all active spawns have finished executing. """
+        with self._running_lock:
+            if not self._running:
+                return True
+            # if a Reply still runs, we let run_and_release
+            # signal us -- note that we are still holding the
+            # _running_lock to avoid race conditions
+            my_waitall_event = self.execmodel.Event()
+            self._waitall_events.append(my_waitall_event)
+        return my_waitall_event.wait(timeout=timeout)
+
 
 sysex = (KeyboardInterrupt, SystemExit)
 
@@ -70,7 +347,7 @@ else:
 class Popen2IO:
     error = (IOError, OSError, EOFError)
 
-    def __init__(self, outfile, infile):
+    def __init__(self, outfile, infile, execmodel):
         # we need raw byte streams
         self.outfile, self.infile = outfile, infile
         if sys.platform == "win32":
@@ -82,6 +359,7 @@ class Popen2IO:
                 pass
         self._read = getattr(infile, "buffer", infile).read
         self._write = getattr(outfile, "buffer", outfile).write
+        self.execmodel = execmodel
 
     def read(self, numbytes):
         """Read exactly 'numbytes' bytes from the pipe. """
@@ -119,6 +397,8 @@ class Message:
     def from_io(io):
         try:
             header = io.read(9) # type 1, channel 4, payload 4
+            if not header:
+                raise EOFError("empty read")
         except EOFError:
             e = sys.exc_info()[1]
             raise EOFError('couldnt load message header, ' + e.args[0])
@@ -126,48 +406,32 @@ class Message:
         return Message(msgtype, channel, io.read(payload))
 
     def to_io(self, io):
-        header = struct.pack('!bii', self.msgcode, self.channelid, len(self.data))
+        header = struct.pack('!bii', self.msgcode, self.channelid,
+                             len(self.data))
         io.write(header+self.data)
 
     def received(self, gateway):
         self._types[self.msgcode](self, gateway)
 
     def __repr__(self):
-        class FakeChannel(object):
-            _strconfig = False, False # never transform, never fail
-            def __init__(self, id):
-                self.id = id
-            def __repr__(self):
-                return '<Channel %s>' % self.id
-        FakeChannel.new = FakeChannel
-        FakeChannel.gateway = FakeChannel
         name = self._types[self.msgcode].__name__.upper()
-        try:
-            data = loads_internal(self.data, FakeChannel)
-        except LoadError:
-            data = self.data
-        r = repr(data)
-        if len(r) > 90:
-            return "<Message.%s channelid=%d len=%d>" %(name,
-                        self.channelid, len(r))
-        else:
-            return "<Message.%s channelid=%d %s>" %(name,
-                        self.channelid, r)
+        return "<Message %s channel=%s lendata=%s>" %(
+                    name, self.channelid, len(self.data))
+
+class GatewayReceivedTerminate(Exception):
+    """ Receiverthread got termination message. """
 
 def _setupmessages():
     def status(message, gateway):
         # we use the channelid to send back information
         # but don't instantiate a channel object
-        active_channels = gateway._channelfactory.channels()
-        numexec = 0
-        for ch in active_channels:
-            if getattr(ch, '_executing', False):
-                numexec += 1
-        d = {'execqsize': gateway._execqueue.qsize(),
-             'numchannels': len(active_channels),
-             'numexecuting': numexec
+        d = {'numchannels': len(gateway._channelfactory._channels),
+             'numexecuting': gateway._execpool.active_count(),
+             'execmodel': gateway.execmodel.backend,
         }
-        gateway._send(Message.CHANNEL_DATA, message.channelid, dumps_internal(d))
+        gateway._send(Message.CHANNEL_DATA, message.channelid,
+                      dumps_internal(d))
+        gateway._send(Message.CHANNEL_CLOSE, message.channelid)
 
     def channel_exec(message, gateway):
         channel = gateway._channelfactory.new(message.channelid)
@@ -187,8 +451,7 @@ def _setupmessages():
         gateway._channelfactory._local_close(message.channelid, sendonly=True)
 
     def gateway_terminate(message, gateway):
-        gateway._terminate_execution()
-        raise SystemExit(0)
+        raise GatewayReceivedTerminate(gateway)
 
     def reconfigure(message, gateway):
         if message.channelid == 0:
@@ -235,7 +498,8 @@ class RemoteError(Exception):
     def warn(self):
         if self.formatted != INTERRUPT_TEXT:
             # XXX do this better
-            sys.stderr.write("Warning: unhandled %r\n" % (self,))
+            sys.stderr.write("[%s] Warning: unhandled %r\n"
+                             % (os.getpid(), self,))
 
 class TimeoutError(IOError):
     """ Exception indicating that a timeout was reached. """
@@ -256,9 +520,9 @@ class Channel(object):
         #XXX: defaults copied from Unserializer
         self._strconfig = getattr(gateway, '_strconfig', (True, False))
         self.id = id
-        self._items = queue.Queue()
+        self._items = self.gateway.execmodel.queue.Queue()
         self._closed = False
-        self._receiveclosed = threading.Event()
+        self._receiveclosed = self.gateway.execmodel.Event()
         self._remoteerrors = []
 
     def _trace(self, *msg):
@@ -275,9 +539,7 @@ class Channel(object):
             be called with the endmarker when the channel closes.
         """
         _callbacks = self.gateway._channelfactory._callbacks
-        _receivelock = self.gateway._receivelock
-        _receivelock.acquire()
-        try:
+        with self.gateway._receivelock:
             if self._items is None:
                 raise IOError("%r has callback already registered" %(self,))
             items = self._items
@@ -285,7 +547,7 @@ class Channel(object):
             while 1:
                 try:
                     olditem = items.get(block=False)
-                except queue.Empty:
+                except self.gateway.execmodel.queue.Empty:
                     if not (self._closed or self._receiveclosed.isSet()):
                         _callbacks[self.id] = (
                             callback,
@@ -301,8 +563,6 @@ class Channel(object):
                         break
                     else:
                         callback(olditem)
-        finally:
-            _receivelock.release()
 
     def __repr__(self):
         flag = self.isclosed() and "closed" or "open"
@@ -323,14 +583,19 @@ class Channel(object):
             pass
         else:
             # state transition "opened" --> "deleted"
-            if self._items is None:    # has_callback
-                msgcode = Message.CHANNEL_LAST_MESSAGE
-            else:
-                msgcode = Message.CHANNEL_CLOSE
-            try:
-                self.gateway._send(msgcode, self.id)
-            except (IOError, ValueError): # ignore problems with sending
-                pass
+            # check if we are in the middle of interpreter shutdown
+            # in which case the process will go away and we probably
+            # don't need to try to send a closing or last message
+            # (and often it won't work anymore to send things out)
+            if Message is not None:
+                if self._items is None:    # has_callback
+                    msgcode = Message.CHANNEL_LAST_MESSAGE
+                else:
+                    msgcode = Message.CHANNEL_CLOSE
+                try:
+                    self.gateway._send(msgcode, self.id)
+                except (IOError, ValueError): # ignore problems with sending
+                    pass
 
     def _getremoteerror(self):
         try:
@@ -365,7 +630,8 @@ class Channel(object):
     def close(self, error=None):
         """ close down this channel with an optional error message.
             Note that closing of a channel tied to remote_exec happens
-            automatically at the end of execution and cannot be done explicitely.
+            automatically at the end of execution and cannot
+            be done explicitely.
         """
         if self._executing:
             raise IOError("cannot explicitly close channel within remote_exec")
@@ -380,7 +646,8 @@ class Channel(object):
             if not self._receiveclosed.isSet():
                 put = self.gateway._send
                 if error is not None:
-                    put(Message.CHANNEL_CLOSE_ERROR, self.id, dumps_internal(error))
+                    put(Message.CHANNEL_CLOSE_ERROR, self.id,
+                        dumps_internal(error))
                 else:
                     put(Message.CHANNEL_CLOSE, self.id)
                 self._trace("sent channel close message")
@@ -422,12 +689,11 @@ class Channel(object):
             raise IOError("cannot send to %r" %(self,))
         self.gateway._send(Message.CHANNEL_DATA, self.id, dumps_internal(item))
 
-    def receive(self, timeout=-1):
+    def receive(self, timeout=None):
         """receive a data item that was sent from the other side.
-        timeout: -1 [default] blocked waiting, but wake up periodically
-        to let CTRL-C through.  A positive number indicates the
-        number of seconds after which a channel.TimeoutError exception
-        will be raised if no item was received.
+        timeout: None [default] blocked waiting.  A positive number
+        indicates the number of seconds after which a channel.TimeoutError
+        exception will be raised if no item was received.
         Note that exceptions from the remotely executing code will be
         reraised as channel.RemoteError exceptions containing
         a textual representation of the remote traceback.
@@ -435,19 +701,10 @@ class Channel(object):
         itemqueue = self._items
         if itemqueue is None:
             raise IOError("cannot receive(), channel has receiver callback")
-        if timeout < 0:
-            internal_timeout = self._INTERNALWAKEUP
-        else:
-            internal_timeout = timeout
-
-        while 1:
-            try:
-                x = itemqueue.get(timeout=internal_timeout)
-                break
-            except queue.Empty:
-                if timeout < 0:
-                    continue
-                raise self.TimeoutError("no item after %r seconds" %(timeout))
+        try:
+            x = itemqueue.get(timeout=timeout)
+        except self.gateway.execmodel.queue.Empty:
+            raise self.TimeoutError("no item after %r seconds" %(timeout))
         if x is ENDMARKER:
             itemqueue.put(x)  # for other receivers
             raise self._getremoteerror() or EOFError()
@@ -482,7 +739,7 @@ class ChannelFactory(object):
     def __init__(self, gateway, startcount=1):
         self._channels = weakref.WeakValueDictionary()
         self._callbacks = {}
-        self._writelock = threading.Lock()
+        self._writelock = gateway.execmodel.Lock()
         self.gateway = gateway
         self.count = startcount
         self.finished = False
@@ -490,8 +747,7 @@ class ChannelFactory(object):
 
     def new(self, id=None):
         """ create a new Channel with 'id' (or create new id if None). """
-        self._writelock.acquire()
-        try:
+        with self._writelock:
             if self.finished:
                 raise IOError("connexion already closed: %s" % (self.gateway,))
             if id is None:
@@ -502,8 +758,6 @@ class ChannelFactory(object):
             except KeyError:
                 channel = self._channels[id] = Channel(self.gateway, id)
             return channel
-        finally:
-            self._writelock.release()
 
     def channels(self):
         return self._list(self._channels.values())
@@ -545,35 +799,32 @@ class ChannelFactory(object):
 
     def _local_receive(self, id, data):
         # executes in receiver thread
+        channel = self._channels.get(id)
         try:
-            callback, endmarker, strconfig= self._callbacks[id]
-            channel = self._channels.get(id)
+            callback, endmarker, strconfig = self._callbacks[id]
         except KeyError:
-            channel = self._channels.get(id)
             queue = channel and channel._items
             if queue is None:
                 pass    # drop data
             else:
-                queue.put(loads_internal(data, channel))
+                item = loads_internal(data, channel)
+                queue.put(item)
         else:
             try:
                 data = loads_internal(data, channel, strconfig)
                 callback(data)   # even if channel may be already closed
-            except KeyboardInterrupt:
-                raise
-            except:
+            except Exception:
                 excinfo = sys.exc_info()
-                self.gateway._trace("exception during callback: %s" % excinfo[1])
+                self.gateway._trace("exception during callback: %s" %
+                                    excinfo[1])
                 errortext = self.gateway._geterrortext(excinfo)
-                self.gateway._send(Message.CHANNEL_CLOSE_ERROR, id, dumps_internal(errortext))
+                self.gateway._send(Message.CHANNEL_CLOSE_ERROR,
+                                   id, dumps_internal(errortext))
                 self._local_close(id, errortext)
 
     def _finished_receiving(self):
-        self._writelock.acquire()
-        try:
+        with self._writelock:
             self.finished = True
-        finally:
-            self._writelock.release()
         for id in self._list(self._channels):
             self._local_close(id, sendonly=True)
         for id in self._list(self._callbacks):
@@ -642,64 +893,56 @@ class BaseGateway(object):
     _sysex = sysex
     id = "<slave>"
 
-    class _StopExecLoop(Exception):
-        pass
-
     def __init__(self, io, id, _startcount=2):
+        self.execmodel = io.execmodel
         self._io = io
         self.id = id
-        self._strconfig = Unserializer.py2str_as_py3str, Unserializer.py3str_as_py2str
+        self._strconfig = (Unserializer.py2str_as_py3str,
+                           Unserializer.py3str_as_py2str)
         self._channelfactory = ChannelFactory(self, _startcount)
-        self._receivelock = threading.RLock()
+        self._receivelock = self.execmodel.RLock()
         # globals may be NONE at process-termination
         self.__trace = trace
         self._geterrortext = geterrortext
+        self._receivepool = self.execmodel.WorkerPool()
 
     def _trace(self, *msg):
         self.__trace(self.id, *msg)
 
     def _initreceive(self):
-        self._receiverthread = threading.Thread(name="receiver",
-                                 target=self._thread_receiver)
-        self._receiverthread.setDaemon(1)
-        self._receiverthread.start()
+        self._receivepool.spawn(self._thread_receiver)
 
     def _thread_receiver(self):
-        self._trace("RECEIVERTHREAD: starting to run")
-        eof = False
+        def log(*msg):
+            self._trace("[receiver-thread]", *msg)
+
+        log("RECEIVERTHREAD: starting to run")
         io = self._io
         try:
-            try:
-                while 1:
-                    msg = Message.from_io(io)
-                    self._trace("received", msg)
-                    _receivelock = self._receivelock
-                    _receivelock.acquire()
-                    try:
-                        msg.received(self)
-                        del msg
-                    finally:
-                        _receivelock.release()
-            except self._sysex:
-                self._trace("RECEIVERTHREAD: doing io.close_read()")
-                self._io.close_read()
-            except EOFError:
-                self._trace("RECEIVERTHREAD: got EOFError")
-                self._trace("RECEIVERTHREAD: traceback was: ",
-                    self._geterrortext(self.exc_info()))
-                self._error = self.exc_info()[1]
-                eof = True
-            except:
-                self._trace("RECEIVERTHREAD", self._geterrortext(self.exc_info()))
-        finally:
-            try:
-                self._trace('RECEIVERTHREAD', 'entering finalization')
-                if eof:
-                    self._terminate_execution()
-                self._channelfactory._finished_receiving()
-                self._trace('RECEIVERTHREAD', 'leaving finalization')
-            except:
-                pass # XXX be silent at interp-shutdown
+            while 1:
+                msg = Message.from_io(io)
+                log("received", msg)
+                with self._receivelock:
+                    msg.received(self)
+                    del msg
+        except (KeyboardInterrupt, GatewayReceivedTerminate):
+            pass
+        except EOFError:
+            log("EOF without prior gateway termination message")
+            self._error = self.exc_info()[1]
+        except Exception:
+            log(self._geterrortext(self.exc_info()))
+        log('finishing receiving thread')
+        # wake up and terminate any execution waiting to receive
+        self._channelfactory._finished_receiving()
+        log('terminating execution')
+        self._terminate_execution()
+        log('closing read')
+        self._io.close_read()
+        log('closing write')
+        self._io.close_write()
+        log('terminating our receive pseudo pool')
+        self._receivepool.trigger_shutdown()
 
     def _terminate_execution(self):
         pass
@@ -712,8 +955,8 @@ class BaseGateway(object):
         except (IOError, ValueError):
             e = sys.exc_info()[1]
             self._trace('failed to send', message, e)
-            raise
-
+            # ValueError might be because the IO is already closed
+            raise IOError("cannot send (already closed?)")
 
     def _local_schedulexec(self, channel, sourcetask):
         channel.close("execution disallowed")
@@ -729,55 +972,50 @@ class BaseGateway(object):
 
     def join(self, timeout=None):
         """ Wait for receiverthread to terminate. """
-        current = threading.currentThread()
-        if self._receiverthread.isAlive():
-            self._trace("joining receiver thread")
-            self._receiverthread.join(timeout)
-        else:
-            self._trace("gateway.join() called while receiverthread "
-                        "already finished")
+        self._trace("waiting for receiver thread to finish")
+        self._receivepool.waitall()
 
 class SlaveGateway(BaseGateway):
+
     def _local_schedulexec(self, channel, sourcetask):
         sourcetask = loads_internal(sourcetask)
-        self._execqueue.put((channel, sourcetask))
+        self._execpool.spawn(self.executetask, ((channel, sourcetask)))
 
     def _terminate_execution(self):
         # called from receiverthread
-        self._trace("putting None to execqueue")
-        self._execqueue.put(None)
-        if interrupt_main:
-            self._trace("calling interrupt_main()")
-            interrupt_main()
-        self._execfinished.wait(10.0)
-        if not self._execfinished.isSet():
-            self._trace("execution did not finish in 10 secs, calling os._exit()")
-            os._exit(1)
+        self._trace("shutting down execution pool")
+        self._execpool.trigger_shutdown()
+        if not self._execpool.waitall(5.0):
+            self._trace("execution ongoing after 5 secs, trying interrupt_main")
+            # We try hard to terminate execution based on the assumption
+            # that there is only one gateway object running per-process.
+            if sys.platform != "win32":
+                self._trace("sending ourselves a SIGINT")
+                os.kill(os.getpid(), 2)  # send ourselves a SIGINT
+            elif interrupt_main is not None:
+                self._trace("calling interrupt_main()")
+                interrupt_main()
+            if not self._execpool.waitall(10.0):
+                self._trace("execution did not finish in another 10 secs, "
+                            "calling os._exit()")
+                os._exit(1)
 
-    def serve(self, joining=True):
+    def serve(self):
+        trace = lambda msg: self._trace("[serve] " + msg)
+        hasprimary = self.execmodel.backend == "thread"
+        self._execpool = self.execmodel.WorkerPool(hasprimary=hasprimary)
+        trace("spawning receiver thread")
+        self._initreceive()
         try:
-            try:
-                self._execqueue = queue.Queue()
-                self._execfinished = threading.Event()
-                self._initreceive()
-                while 1:
-                    item = self._execqueue.get()
-                    if item is None:
-                        break
-                    try:
-                        self.executetask(item)
-                    except self._StopExecLoop:
-                        break
-            finally:
-                self._execfinished.set()
-                self._trace("io.close_write()")
-                self._io.close_write()
-                self._trace("slavegateway.serve finished")
-            if joining:
-                self.join()
+            if hasprimary:
+                # this will return when we are in shutdown
+                trace("integrating as primary thread")
+                self._execpool.integrate_as_primary_thread()
+            trace("joining receiver thread")
+            self.join()
         except KeyboardInterrupt:
             # in the slave we can't really do anything sensible
-            self._trace("swallowing keyboardinterrupt in main-thread")
+            trace("swallowing keyboardinterrupt, serve finished")
 
     def executetask(self, item):
         try:
@@ -796,8 +1034,8 @@ class SlaveGateway(BaseGateway):
                             (channel.id, repr(source)[:50]))
             channel._executing = True
             try:
-                co = compile(source+'\n', '', 'exec')
-                do_exec(co, loc)
+                co = compile(source+'\n', '<remote exec>', 'exec')
+                do_exec(co, loc) # noqa
                 if call_name:
                     self._trace('calling %s(**%60r)' % (call_name, kwargs))
                     function = loc[call_name]
@@ -805,19 +1043,19 @@ class SlaveGateway(BaseGateway):
             finally:
                 channel._executing = False
                 self._trace("execution finished")
-        except self._StopExecLoop:
-            channel.close()
-            raise
         except KeyboardInterrupt:
             channel.close(INTERRUPT_TEXT)
             raise
         except:
             excinfo = self.exc_info()
-            self._trace("got exception: %s" % (excinfo[1],))
-            errortext = self._geterrortext(excinfo)
-            channel.close(errortext)
-        else:
-            channel.close()
+            if not isinstance(excinfo[1], EOFError):
+                if not channel.gateway._channelfactory.finished:
+                    self._trace("got exception: %r" % (excinfo[1],))
+                    errortext = self._geterrortext(excinfo)
+                    channel.close(errortext)
+                    return
+            self._trace("ignoring EOFError because receiving finished")
+        channel.close()
 
 #
 # Cross-Python pickling code, tested from test_serializer.py
@@ -865,7 +1103,7 @@ class Unserializer(object):
         if versioned:
             ver = self.stream.read(1)
             if ver != DUMPFORMAT_VERSION:
-                raise LoadError("wrong dumpformat version")
+                raise LoadError("wrong dumpformat version %r" % ver)
         self.stack = []
         try:
             while True:
@@ -1190,9 +1428,9 @@ class _Serializer(object):
         self._write(opcode.CHANNEL)
         self._write_int4(channel.id)
 
-def init_popen_io():
+def init_popen_io(execmodel):
     if not hasattr(os, 'dup'): # jython
-        io = Popen2IO(sys.stdout, sys.stdin)
+        io = Popen2IO(sys.stdout, sys.stdin, execmodel)
         import tempfile
         sys.stdin = tempfile.TemporaryFile('r')
         sys.stdout = tempfile.TemporaryFile('w')
@@ -1205,24 +1443,24 @@ def init_popen_io():
             else:
                 devnull = '/dev/null'
         # stdin
-        stdin  = os.fdopen(os.dup(0), 'r', 1)
+        stdin  = execmodel.fdopen(os.dup(0), 'r', 1)
         fd = os.open(devnull, os.O_RDONLY)
         os.dup2(fd, 0)
         os.close(fd)
 
         # stdout
-        stdout = os.fdopen(os.dup(1), 'w', 1)
+        stdout = execmodel.fdopen(os.dup(1), 'w', 1)
         fd = os.open(devnull, os.O_WRONLY)
         os.dup2(fd, 1)
 
         # stderr for win32
         if os.name == 'nt':
-            sys.stderr = os.fdopen(os.dup(2), 'w', 1)
+            sys.stderr = execmodel.fdopen(os.dup(2), 'w', 1)
             os.dup2(fd, 2)
         os.close(fd)
-        io = Popen2IO(stdout, stdin)
-        sys.stdin = os.fdopen(0, 'r', 1)
-        sys.stdout = os.fdopen(1, 'w', 1)
+        io = Popen2IO(stdout, stdin, execmodel)
+        sys.stdin = execmodel.fdopen(0, 'r', 1)
+        sys.stdout = execmodel.fdopen(1, 'w', 1)
     return io
 
 def serve(io, id):

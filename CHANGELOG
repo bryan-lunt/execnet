@@ -1,15 +1,79 @@
-1.X
+XXX
 --------------------------------
+
+- fix issue33: index.txt to correctly mention MIT instead of GPL.
+
+- fix issue35: adapt some doctests, fix some channel tests for py3.
+
+- use subprocess32 when available for python < 3.
+
+- try to be a bit more careful when interpreter is shutting down
+  to avoid random exceptions, thanks Alfredo Deza.
+
+
+1.2
+--------------------------------
+
+- fix issue22 -- during interpreter shutdown don't throw
+  an exception when we can't send a termination sequence
+  anymore as we are about to die anyway.
+
+- fix issue24 -- allow concurrent creation of gateways
+  by guarding automatic id creation by a look.
+  Thanks tlecomte.
+
+- majorly refactor internal thread and IO handling.
+  execnet can now operate on different thread models,
+  defaults to "thread" but allows for eventlet and
+  gevent if it is installed.
+
+- gateway.remote_exec() will now execute in multiple
+  threads on the other side by default.  The previous
+  neccessity of running "gateway.remote_init_threads()"
+  to allow for such concurrency is gone.  The latter
+  method is now a no-op and will be removed in future
+  versions of execnet.
+
+- fix issue20: prevent AttributError at interpreter shutdown
+  by not trying to send close/last_message messages if the
+  world around is half destroyed.
+
+- fix issue21: allow to create local gateways with sudo aka
+  makegateway("popen//python=sudo python").
+  Thanks Alfredo Deza for the PR.
+
+- streamline gateway termination and simplify proxy
+  implementation. add more internal tracing.
+
+- if execution hangs in computation, we now try to
+  send a SIGINT to ourselves on Unix platforms
+  instead of just calling thread.interrupt_main()
+
+- change license from GPL to MIT
 
 - introduce execnet.dump/load variants of dumps/loads
   serializing/unserializing mechanism.
 
-- fix issue10 : skip PYTHONDONTWRITEBYTECODE test if 
+- improve channel.receive() communication latency on python2
+  by changing the default timeout of the underlying Queue.get
+  to a regular None instead of the previous default -1
+  which caused an internal positive timeout value
+  (a hack probably introduced to allow CTRL-C to pass
+  through for <python2.5 versions).
+
+- extended ssh-syntax to allow passing of command line args,
+  e.g.  "ssh= -p 50 hostname". The options are passed to
+  the underlying ssh client binary.  Thanks tundish.
+
+- fix issue15: interoperability with inspect.getstack().
+  Thanks Peter Feiner.
+
+- fix issue10 : skip PYTHONDONTWRITEBYTECODE test if
   it we are running with PYTHONDONTWRITEBYTECODE set.
 
-- change license to MIT
-
 - dont try the jython pid fixup on a RemoteIO
+
+- avoid accidentally setting exc_info() in gateway_base.py
 
 1.1
 --------------------------------

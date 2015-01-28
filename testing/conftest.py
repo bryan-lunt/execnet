@@ -1,7 +1,9 @@
 import execnet
 import py
-import os, sys
+import pytest
+import sys
 import subprocess
+from execnet.gateway_base import get_execmodel, WorkerPool
 
 collect_ignore = ['build', 'doc/_build']
 
@@ -10,22 +12,22 @@ rsyncdirs = ['conftest.py', 'execnet', 'testing', 'doc']
 winpymap = {
     'python2.7': r'C:\Python27\python.exe',
     'python2.6': r'C:\Python26\python.exe',
-    'python2.5': r'C:\Python25\python.exe',
-    'python2.4': r'C:\Python24\python.exe',
     'python3.1': r'C:\Python31\python.exe',
-    'python3.2': r'C:\Python31\python.exe',
-    'python3.3': r'C:\Python31\python.exe',
+    'python3.2': r'C:\Python32\python.exe',
+    'python3.3': r'C:\Python33\python.exe',
+    'python3.4': r'C:\Python34\python.exe',
 }
 
 def pytest_runtest_setup(item, __multicall__):
     if item.fspath.purebasename in ('test_group', 'test_info'):
         getspecssh(item.config) # will skip if no gx given
     res = __multicall__.execute()
-    if 'pypy-c' in item.keywords and not item.config.option.pypy:
-        py.test.skip("pypy-c tests skipped, use --pypy to run them.")
+    if 'pypy' in item.keywords and not item.config.option.pypy:
+        py.test.skip("pypy tests skipped, use --pypy to run them.")
     return res
 
-def pytest_funcarg__makegateway(request):
+@pytest.fixture
+def makegateway(request):
     group = execnet.Group()
     request.addfinalizer(lambda: group.terminate(0.5))
     return group.makegateway
@@ -42,7 +44,7 @@ def pytest_addoption(parser):
            type="choice", choices=["session", "function"],
            help=("set gateway setup scope, default: session."))
     group.addoption('--pypy', action="store_true", dest="pypy",
-           help=("run some tests also against pypy-c"))
+           help=("run some tests also against pypy"))
     group.addoption('--broken-isp', action="store_true", dest="broken_isp",
             help=("Skips tests that assume your ISP doesn't put up a landing "
                 "page on invalid addresses"))
@@ -91,14 +93,16 @@ def pytest_generate_tests(metafunc):
         metafunc.parametrize("gw", gwtypes, indirect=True)
     elif 'anypython' in metafunc.funcargnames:
         metafunc.parametrize("anypython", indirect=True, argvalues=
-            ('python3.3', 'python3.2', 'python2.5',
-             'python2.6', 'python2.7', 'pypy-c', 'jython')
+            ('sys.executable', 'python3.3', 'python3.2',
+             'python2.6', 'python2.7', 'pypy', 'jython')
         )
 
 def getexecutable(name, cache={}):
     try:
         return cache[name]
     except KeyError:
+        if name == 'sys.executable':
+            return py.path.local(sys.executable)
         executable = py.path.local.sysfind(name)
         if executable:
             if name == "jython":
@@ -110,7 +114,8 @@ def getexecutable(name, cache={}):
         cache[name] = executable
         return executable
 
-def pytest_funcarg__anypython(request):
+@pytest.fixture
+def anypython(request):
     name = request.param
     executable = getexecutable(name)
     if executable is None:
@@ -122,9 +127,14 @@ def pytest_funcarg__anypython(request):
                     return executable
                 executable = None
         py.test.skip("no %s found" % (name,))
+    if "execmodel" in request.fixturenames and name != 'sys.executable':
+        backend = request.getfuncargvalue("execmodel").backend
+        if backend != "thread":
+            pytest.xfail("cannot run %r execmodel with bare %s" % (backend, name))
     return executable
 
-def pytest_funcarg__gw(request):
+@pytest.fixture
+def gw(request, execmodel):
     scope = request.config.option.scope
     group = request.cached_setup(
         setup=execnet.Group,
@@ -136,20 +146,40 @@ def pytest_funcarg__gw(request):
         return group[request.param]
     except KeyError:
         if request.param == "popen":
-            gw = group.makegateway("popen//id=popen")
+            gw = group.makegateway("popen//id=popen//execmodel=%s"
+                                   % execmodel.backend)
         elif request.param == "socket":
+            #if execmodel.backend != "thread":
+            #    pytest.xfail("cannot set remote non-thread execmodel for sockets")
             pname = 'sproxy1'
             if pname not in group:
                 proxygw = group.makegateway("popen//id=%s" % pname)
             #assert group['proxygw'].remote_status().receiving
-            gw = group.makegateway("socket//id=socket//installvia=%s" % pname)
+            gw = group.makegateway("socket//id=socket//installvia=%s"
+                                   "//execmodel=%s" % (pname, execmodel.backend))
             gw.proxygw = proxygw
             assert pname in group
-
         elif request.param == "ssh":
             sshhost = request.getfuncargvalue('specssh').ssh
-            gw = group.makegateway("ssh=%s//id=ssh" %(sshhost,))
+            # we don't use execmodel.backend here
+            # but you can set it when specifying the ssh spec
+            gw = group.makegateway("ssh=%s//id=ssh" % (sshhost,))
         elif request.param == 'proxy':
-            master = group.makegateway('popen//id=proxy-transport')
-            gw = group.makegateway('popen//via=proxy-transport//id=proxy')
+            group.makegateway('popen//id=proxy-transport')
+            gw = group.makegateway('popen//via=proxy-transport//id=proxy'
+                                   '//execmodel=%s' % execmodel.backend)
         return gw
+
+
+@pytest.fixture(params=["thread", "eventlet", "gevent"], scope="session")
+def execmodel(request):
+    if request.param != "thread":
+        pytest.importorskip(request.param)
+    if sys.platform == "win32":
+             pytest.xfail("eventlet/gevent do not work onwin32")
+    return get_execmodel(request.param)
+
+
+@pytest.fixture
+def pool(execmodel):
+    return WorkerPool(execmodel=execmodel)

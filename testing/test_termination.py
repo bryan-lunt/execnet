@@ -1,17 +1,13 @@
-
-import sys, os
+import pytest
 import execnet
-import time
 import subprocess
 import py
-from execnet.threadpool import WorkerPool
-queue = py.builtin._tryimport('queue', 'Queue')
-from testing.test_gateway import TESTTIMEOUT
+from test_gateway import TESTTIMEOUT
 execnetdir = py.path.local(execnet.__file__).dirpath().dirpath()
 
-def test_exit_blocked_slave_execution_gateway(anypython, makegateway):
+def test_exit_blocked_slave_execution_gateway(anypython, makegateway, pool):
     gateway = makegateway('popen//python=%s' % anypython)
-    channel = gateway.remote_exec("""
+    gateway.remote_exec("""
         import time
         time.sleep(10.0)
     """)
@@ -19,14 +15,15 @@ def test_exit_blocked_slave_execution_gateway(anypython, makegateway):
         gateway.exit()
         return 17
 
-    pool = WorkerPool()
-    reply = pool.dispatch(doit)
+    reply = pool.spawn(doit)
     x = reply.get(timeout=5.0)
     assert x == 17
 
-def test_endmarker_delivery_on_remote_killterm(makegateway):
+def test_endmarker_delivery_on_remote_killterm(makegateway, execmodel):
+    if execmodel.backend != "thread":
+        pytest.xfail("test and execnet not compatible to greenlets yet")
     gw = makegateway('popen')
-    q = queue.Queue()
+    q = execmodel.queue.Queue()
     channel = gw.remote_exec(source='''
         import os, time
         channel.send(os.getpid())
@@ -55,16 +52,12 @@ def test_termination_on_remote_channel_receive(monkeypatch, makegateway):
     out = py.builtin._totext(out, 'utf8')
     assert str(pid) not in out, out
 
-@py.test.mark.xfail(reason="non-resolved race/wait/interrupt_main/thread-loop "
- "isdue with some Python interpreters")
 def test_close_initiating_remote_no_error(testdir, anypython):
     p = testdir.makepyfile("""
         import sys
         sys.path.insert(0, %r)
         import execnet
         gw = execnet.makegateway("popen")
-        print ("remoteinitthreads")
-        gw.remote_init_threads(num=2)
         print ("remote_exec1")
         ch1 = gw.remote_exec("channel.receive()")
         print ("remote_exec1")
@@ -79,10 +72,12 @@ def test_close_initiating_remote_no_error(testdir, anypython):
     err = err.decode('utf8')
     lines = [x for x in err.splitlines()
                if '*sys-package' not in x]
-    print (lines)
+    #print (lines)
     assert not lines
 
-def test_terminate_implicit_does_trykill(testdir, anypython, capfd):
+def test_terminate_implicit_does_trykill(testdir, anypython, capfd, pool):
+    if pool.execmodel != "thread":
+        pytest.xfail("only os threading model supported")
     p = testdir.makepyfile("""
         import sys
         sys.path.insert(0, %r)
@@ -105,8 +100,8 @@ def test_terminate_implicit_does_trykill(testdir, anypython, capfd):
     """ % str(execnetdir))
     popen = subprocess.Popen([str(anypython), str(p)], stdout=subprocess.PIPE)
     # sync with start-up
-    line = popen.stdout.readline()
-    reply = WorkerPool(1).dispatch(popen.communicate)
+    popen.stdout.readline()
+    reply = pool.spawn(popen.communicate)
     reply.get(timeout=50)
     out, err = capfd.readouterr()
     lines = [x for x in err.splitlines()

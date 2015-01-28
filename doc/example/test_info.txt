@@ -95,13 +95,13 @@ Use simple execution to obtain information from remote environments::
   >>> gw = execnet.makegateway("ssh=codespeak.net")
   >>> channel = gw.remote_exec("""
   ...     import sys, os
-  ...     channel.send((sys.platform, sys.version_info, os.getpid()))
+  ...     channel.send((sys.platform, tuple(sys.version_info), os.getpid()))
   ... """)
   >>> platform, version_info, remote_pid = channel.receive()
   >>> platform
   'linux2'
   >>> version_info
-  (2, 4, 2, 'final', 0)
+  (2, 6, 6, 'final', 0)
 
 Use a callback instead of receive() and wait for completion
 -------------------------------------------------------------

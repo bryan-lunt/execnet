@@ -3,7 +3,7 @@ sysinfo.py [host1] [host2] [options]
 
 obtain system info from remote machine.
 
-(c) Holger Krekel, GPLv2 or 3
+(c) Holger Krekel, MIT license
 """
 
 import py
@@ -96,10 +96,10 @@ def error(*args):
     debug("ERROR", args[0] + ":", *args[1:])
 
 def getinfo(sshname, ssh_config=None, loginfo=sys.stdout):
-    import execnet
-    spec = "ssh=%s" % sshname
     if ssh_config:
-        spec += "ssh_config=%s" % ssh_config
+        spec = "ssh=-F %s %s" % (ssh_config, sshname)
+    else:
+        spec += "ssh=%s" % sshname
     debug("connecting to", repr(spec))
     try:
         gw = execnet.makegateway(spec)
