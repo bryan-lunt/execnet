@@ -3,7 +3,8 @@ import py
 import sys
 import pytest
 import execnet
-from execnet.gateway_io import ssh_args, popen_args
+import subprocess
+from execnet.gateway_io import ssh_args, popen_args, vagrant_ssh_args
 
 XSpec = execnet.XSpec
 
@@ -58,6 +59,11 @@ class TestXSpec:
         spec.ssh_config = "/home/user/ssh_config"
         assert ssh_args(spec)[:6] == [
             "ssh", "-C", "-F", spec.ssh_config, "-p", "22100"]
+
+    def test_vagrant_options(self):
+        spec = XSpec("vagrant_ssh=default//python=python3")
+        assert vagrant_ssh_args(spec)[:-1] == [
+            'vagrant', 'ssh', 'default', '--', '-C']
 
     def test_popen_with_sudo_python(self):
         spec = XSpec("popen//python=sudo python3")
@@ -196,6 +202,19 @@ class TestMakegateway:
         assert rinfo.executable == rinfo2.executable
         assert rinfo.cwd == rinfo2.cwd
         assert rinfo.version_info == rinfo2.version_info
+
+    def test_vagrant(self, makegateway, tmpdir, monkeypatch):
+        vagrant = py.path.local.sysfind('vagrant')
+        if vagrant is None:
+            pytest.skip('Vagrant binary not in PATH')
+        monkeypatch.chdir(tmpdir)
+        subprocess.check_call("vagrant init hashicorp/precise32", shell=True)
+        subprocess.check_call("vagrant up --provider virtualbox", shell=True)
+        gw = makegateway("vagrant_ssh=default")
+        rinfo = gw._rinfo()
+        rinfo.cwd == '/home/vagrant'
+        rinfo.executable == '/usr/bin/python'
+        subprocess.check_call("vagrant halt", shell=True)
 
     def test_socket(self, specsocket, makegateway):
         gw = makegateway("socket=%s//id=sock1" % specsocket.socket)
