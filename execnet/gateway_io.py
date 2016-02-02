@@ -77,6 +77,7 @@ def popen_args(spec):
     args.extend(['-c', popen_bootstrapline])
     return args
 
+from gateway_htcondor import htcondor_args
 
 def ssh_args(spec):
     # NOTE: If changing this, you need to sync those changes to vagrant_args
@@ -113,8 +114,8 @@ def create_io(spec, execmodel):
     if spec.popen:
         args = popen_args(spec)
         return Popen2IOMaster(args, execmodel)
-    if spec.ssh:
-        args = ssh_args(spec)
+    if spec.ssh or spec.htcondor:
+        args = ssh_args(spec) if not spec.htcondor else htcondor_args(spec)
         io = Popen2IOMaster(args, execmodel)
         io.remoteaddress = spec.ssh
         return io
